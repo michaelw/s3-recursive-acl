@@ -1,68 +1,90 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
-	"sync"
+	"net/http"
+	"runtime"
+	"sync/atomic"
+
+	"github.com/pkg/errors"
+
+	"github.com/hashicorp/go-cleanhttp"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+
+	"github.com/michaelw/mars"
 )
 
 func main() {
-	var bucket, region, path, cannedACL string
-	var wg sync.WaitGroup
-	var counter int64
-	var dryRun bool
-	flag.StringVar(&region, "region", "ap-northeast-1", "AWS region")
-	flag.StringVar(&bucket, "bucket", "s3-bucket", "Bucket name")
-	flag.StringVar(&path, "path", "/", "Path to recurse under")
-	flag.StringVar(&cannedACL, "acl", "public-read", "Canned ACL to assign objects")
-	flag.BoolVar(&dryRun, "dryrun", true, "do not change ACL")
+	var (
+		region      = flag.String("region", "ap-northeast-1", "AWS region")
+		bucket      = flag.String("bucket", "s3-bucket", "Bucket name")
+		path        = flag.String("path", "/", "Path to recurse under")
+		cannedACL   = flag.String("acl", "public-read", "Canned ACL to assign objects")
+		dryRun      = flag.Bool("dryrun", true, "dry run, do not change permissions")
+		concurrency = flag.Int("p", runtime.GOMAXPROCS(0), "concurrency level")
+	)
 	flag.Parse()
 
-	svc := s3.New(session.Must(session.NewSession()), &aws.Config{
-		Region: aws.String(region),
+	tr := cleanhttp.DefaultPooledTransport()
+	tr.MaxConnsPerHost = *concurrency
+	svc := s3.New(session.Must(session.NewSession(&aws.Config{
+		Region: region,
+		// LogLevel: aws.LogLevel(aws.LogDebugWithRequestErrors | aws.LogDebugWithRequestRetries),
+		HTTPClient: &http.Client{
+			Transport: tr,
+		},
+	})))
+
+	M := mars.New(context.Background(), mars.Config{
+		Concurrency: *concurrency,
 	})
 
-	err := svc.ListObjectsPages(&s3.ListObjectsInput{
-		Prefix: aws.String(path),
-		Bucket: aws.String(bucket),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		for _, object := range page.Contents {
-			key := *object.Key
-			counter++
-			wg.Add(1)
-			go func(bucket string, key string, cannedACL string) {
-				if dryRun {
-					log.Printf("[DRYRUN] Updating '%s'", key)
-					_, _ = svc.GetObjectAcl(&s3.GetObjectAclInput{
-						Bucket: aws.String(bucket),
-						Key:    aws.String(key),
-					})
-				} else {
-					log.Printf("Updating '%s'", key)
-					_, err := svc.PutObjectAcl(&s3.PutObjectAclInput{
-						ACL:    aws.String(cannedACL),
-						Bucket: aws.String(bucket),
-						Key:    aws.String(key),
-					})
-					if err != nil {
-						log.Printf("Failed to change permissions on %q, %v", key, err)
+	var counter int64
+	// nolint:errcheck
+	M.SubmitFn(func(ctx context.Context) error {
+		defer M.Shutdown()
+		return svc.ListObjectsPages(&s3.ListObjectsInput{
+			Prefix: path,
+			Bucket: bucket,
+		}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+			for _, obj := range page.Contents {
+				obj := obj
+				err := M.SubmitFn(func(ctx context.Context) error {
+					atomic.AddInt64(&counter, 1)
+					if *dryRun {
+						log.Printf("[DRYRUN] Updating %q", *obj.Key)
+						_, err := svc.GetObjectAclWithContext(ctx, &s3.GetObjectAclInput{
+							Bucket: bucket,
+							Key:    obj.Key,
+						})
+						return errors.Wrapf(err, "Failed to get permissions: %v", *obj.Key)
+					} else {
+						log.Printf("Updating %q", *obj.Key)
+						_, err := svc.PutObjectAclWithContext(ctx, &s3.PutObjectAclInput{
+							ACL:    cannedACL,
+							Bucket: bucket,
+							Key:    obj.Key,
+						})
+						return errors.Wrapf(err, "Failed to change permissions: %v", *obj.Key)
 					}
+				})
+				if err != nil {
+					return false
 				}
-				defer wg.Done()
-			}(bucket, key, cannedACL)
-		}
-		return true
+			}
+			log.Printf("Processing %d", atomic.LoadInt64(&counter))
+			return true
+		})
 	})
 
-	wg.Wait()
-
-	if err != nil {
+	if err := M.Wait(); err != nil {
 		log.Fatal(err)
 	}
 
-	log.Printf("Successfully updated permissions on %d objects", counter)
+	log.Printf("Updated permissions on %d objects", atomic.LoadInt64(&counter))
 }
