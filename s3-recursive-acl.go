@@ -27,11 +27,14 @@ func main() {
 		cannedACL   = flag.String("acl", "public-read", "Canned ACL to assign objects")
 		dryRun      = flag.Bool("dryrun", true, "dry run, do not change permissions")
 		concurrency = flag.Int("p", runtime.GOMAXPROCS(0), "concurrency level")
+		maxConn     = flag.Int("maxconn", 0, "max. number of connections per host")
 	)
 	flag.Parse()
 
 	tr := cleanhttp.DefaultPooledTransport()
-	tr.MaxConnsPerHost = *concurrency
+	if *maxConn > 0 {
+		tr.MaxConnsPerHost = *maxConn
+	}
 	svc := s3.New(session.Must(session.NewSession(&aws.Config{
 		Region: region,
 		// LogLevel: aws.LogLevel(aws.LogDebugWithRequestErrors | aws.LogDebugWithRequestRetries),
